@@ -1,0 +1,218 @@
+const express = require('express');
+const cors = require('cors');
+const { Pool } = require('pg');
+const { publishEvent } = require('./shared/eventBus');
+
+const app = express();
+const PORT = process.env.PORT || 3008;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || 'postgresql://ecommerce:ecommerce123@postgres:5432/ecommerce'
+});
+
+app.use(cors());
+app.use(express.json());
+
+// Prometheus metrics (MUST be before other routes)
+const promClient = require('prom-client');
+const register = new promClient.Registry();
+promClient.collectDefaultMetrics({ register });
+
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', register.contentType);
+  res.end(await register.metrics());
+});
+
+app.get('/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ status: 'Payment Service running', database: 'connected' });
+  } catch (err) {
+    res.status(503).json({ status: 'Payment Service running', database: 'disconnected' });
+  }
+});
+
+// Process payment
+app.post('/process', async (req, res) => {
+  try {
+    const { orderId, userId, amount, method, cardDetails } = req.body;
+
+    if (!orderId || !userId || !amount || !method) {
+      return res.status(400).json({ error: 'Missing required payment details' });
+    }
+
+    console.log(`[Payment] Processing payment for order ${orderId}, user ${userId}, amount $${amount}`);
+
+    // Mock payment processing (90% success rate)
+    const isSuccess = Math.random() > 0.1;
+    const transactionId = `TXN-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    // Save payment to database
+    const result = await pool.query(
+      `INSERT INTO payments (order_id, user_id, amount, method, transaction_id, status, failure_reason)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING *`,
+      [
+        orderId,
+        userId,
+        amount,
+        method,
+        transactionId,
+        isSuccess ? 'completed' : 'failed',
+        isSuccess ? null : 'Insufficient funds'
+      ]
+    );
+
+    const payment = result.rows[0];
+
+    if (isSuccess) {
+      console.log(`[Payment] ✅ Payment ${payment.id} completed for order ${orderId}`);
+
+      // Publish event (non-blocking)
+      publishEvent('payment.completed', {
+        paymentId: payment.id,
+        orderId,
+        userId,
+        amount,
+        method,
+        transactionId,
+        processedAt: payment.processed_at
+      }).catch(err => console.error('[Payment] Event publish error:', err));
+
+      res.json({
+        success: true,
+        payment: {
+          id: payment.id,
+          orderId: payment.order_id,
+          transactionId: payment.transaction_id,
+          status: payment.status,
+          amount: parseFloat(payment.amount),
+          processedAt: payment.processed_at
+        },
+        message: 'Payment processed successfully'
+      });
+    } else {
+      console.log(`[Payment] ❌ Payment ${payment.id} failed for order ${orderId}`);
+
+      // Publish event (non-blocking)
+      publishEvent('payment.failed', {
+        paymentId: payment.id,
+        orderId,
+        userId,
+        amount,
+        reason: 'Insufficient funds',
+        processedAt: payment.processed_at
+      }).catch(err => console.error('[Payment] Event publish error:', err));
+
+      res.status(400).json({
+        success: false,
+        payment: {
+          id: payment.id,
+          orderId: payment.order_id,
+          status: payment.status,
+          failureReason: payment.failure_reason
+        },
+        message: 'Payment failed'
+      });
+    }
+  } catch (error) {
+    console.error('[Payment] Process error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Payment processing failed', 
+      details: error.message 
+    });
+  }
+});
+
+// Get payment details
+app.get('/:paymentId', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM payments WHERE id = $1',
+      [req.params.paymentId]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: 'Payment not found' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch payment' });
+  }
+});
+
+// Get payments by order
+app.get('/order/:orderId', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM payments WHERE order_id = $1 ORDER BY processed_at DESC',
+      [req.params.orderId]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch payments' });
+  }
+});
+
+// Refund payment
+app.post('/:paymentId/refund', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM payments WHERE id = $1',
+      [req.params.paymentId]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: 'Payment not found' });
+    }
+
+    const payment = result.rows[0];
+
+    if (payment.status !== 'completed') {
+      return res.status(400).json({ error: 'Only completed payments can be refunded' });
+    }
+
+    const refundId = `REF-${Date.now()}`;
+
+    await pool.query(
+      `UPDATE payments 
+       SET status = 'refunded', failure_reason = $1 
+       WHERE id = $2`,
+      [`Refunded: ${refundId}`, req.params.paymentId]
+    );
+
+    res.json({
+      success: true,
+      refundId,
+      message: 'Refund processed successfully'
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Refund processing failed' });
+  }
+});
+
+// Validate card (mock)
+app.post('/validate-card', (req, res) => {
+  const { cardNumber, expiryDate, cvv } = req.body;
+
+  if (!cardNumber || !expiryDate || !cvv) {
+    return res.status(400).json({ valid: false, error: 'Missing card details' });
+  }
+
+
+// Prometheus metrics
+const promClient = require('prom-client');
+const register = new promClient.Registry();
+promClient.collectDefaultMetrics({ register });
+
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', register.contentType);
+  res.end(await register.metrics());
+});
+
+app.listen(PORT, () => {
+  console.log(`Payment Service running on port ${PORT}`);
+});

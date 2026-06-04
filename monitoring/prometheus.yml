@@ -1,0 +1,102 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Database Exporters
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  - job_name: 'mongodb'
+    static_configs:
+      - targets: ['mongodb-exporter:9216']
+
+  - job_name: 'elasticsearch'
+    static_configs:
+      - targets: ['elasticsearch-exporter:9114']
+
+  # RabbitMQ (built-in Prometheus plugin)
+  - job_name: 'rabbitmq'
+    static_configs:
+      - targets: ['rabbitmq:15692']
+
+  # Microservices (all have /metrics endpoint)
+  - job_name: 'api-gateway'
+    static_configs:
+      - targets: ['api-gateway:3000']
+
+  - job_name: 'auth-service'
+    static_configs:
+      - targets: ['auth-service:3001']
+
+  - job_name: 'user-service'
+    static_configs:
+      - targets: ['user-service:3002']
+
+  - job_name: 'product-service'
+    static_configs:
+      - targets: ['product-service:3003']
+
+  - job_name: 'cart-service'
+    static_configs:
+      - targets: ['cart-service:3004']
+
+  - job_name: 'order-service'
+    static_configs:
+      - targets: ['order-service:3005']
+
+  - job_name: 'review-service'
+    static_configs:
+      - targets: ['review-service:3006']
+
+  - job_name: 'rating-service'
+    static_configs:
+      - targets: ['rating-service:3007']
+
+  - job_name: 'payment-service'
+    static_configs:
+      - targets: ['payment-service:3008']
+
+  - job_name: 'notification-service'
+    static_configs:
+      - targets: ['notification-service:3009']
+
+  - job_name: 'admin-service'
+    static_configs:
+      - targets: ['admin-service:3010']
+
+  - job_name: 'inventory-service'
+    static_configs:
+      - targets: ['inventory-service:3011']
+
+  - job_name: 'search-service'
+    static_configs:
+      - targets: ['search-service:3012']
+
+  # Python Services
+  - job_name: 'analytics-service'
+    static_configs:
+      - targets: ['analytics-service:3013']
+
+  - job_name: 'recommendation-service'
+    static_configs:
+      - targets: ['recommendation-service:3014']
+
+  - job_name: 'email-service'
+    static_configs:
+      - targets: ['email-service:3015']
+
+  # Frontend (Nginx)
+  - job_name: 'frontend'
+    static_configs:
+      - targets: ['nginx-exporter:9113']

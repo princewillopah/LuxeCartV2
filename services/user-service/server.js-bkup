@@ -1,0 +1,137 @@
+const express = require('express');
+const cors = require('cors');
+const { Pool } = require('pg');
+
+const app = express();
+const PORT = process.env.PORT || 3002;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL
+});
+
+app.use(cors());
+app.use(express.json());
+
+// Prometheus metrics (MUST be before other routes)
+const promClient = require('prom-client');
+const register = new promClient.Registry();
+promClient.collectDefaultMetrics({ register });
+
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', register.contentType);
+  res.end(await register.metrics());
+});
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'User Service is running' });
+});
+
+// Get all users (admin only) - REAL DATA
+app.get('/', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT id, email, first_name, last_name, role, created_at 
+      FROM users 
+      ORDER BY created_at DESC
+    `);
+
+    const users = result.rows.map(user => ({
+      id: user.id,
+      email: user.email,
+      firstName: user.first_name,
+      lastName: user.last_name,
+      role: user.role,
+      createdAt: user.created_at
+    }));
+
+    res.json(users);
+  } catch (error) {
+    console.error('Get users error:', error);
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+// Get user by ID
+app.get('/:id', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, email, first_name, last_name, role, phone, created_at FROM users WHERE id = $1',
+      [req.params.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const user = result.rows[0];
+    res.json({
+      id: user.id,
+      email: user.email,
+      firstName: user.first_name,
+      lastName: user.last_name,
+      role: user.role,
+      phone: user.phone,
+      createdAt: user.created_at
+    });
+  } catch (error) {
+    console.error('Get user error:', error);
+    res.status(500).json({ error: 'Failed to fetch user' });
+  }
+});
+
+// Update user
+app.put('/:id', async (req, res) => {
+  try {
+    const { firstName, lastName, phone } = req.body;
+
+    const result = await pool.query(
+      `UPDATE users 
+       SET first_name = $1, last_name = $2, phone = $3, updated_at = NOW()
+       WHERE id = $4
+       RETURNING id, email, first_name, last_name, role, phone`,
+      [firstName, lastName, phone, req.params.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const user = result.rows[0];
+    res.json({
+      id: user.id,
+      email: user.email,
+      firstName: user.first_name,
+      lastName: user.last_name,
+      role: user.role,
+      phone: user.phone
+    });
+  } catch (error) {
+    console.error('Update user error:', error);
+    res.status(500).json({ error: 'Failed to update user' });
+  }
+});
+
+// Delete user
+app.delete('/:id', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'DELETE FROM users WHERE id = $1 RETURNING id',
+      [req.params.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+
+// Prometheus metrics
+const promClient = require('prom-client');
+const register = new promClient.Registry();
+promClient.collectDefaultMetrics({ register });
+
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', register.contentType);
+  res.end(await register.metrics());
+});
+
+app.listen(PORT, () => {
+  console.log(`User Service running on port ${PORT}`);
+});

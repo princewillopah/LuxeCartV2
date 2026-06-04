@@ -1,0 +1,626 @@
+services:
+
+  # ─── DATA TIER ─────────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ecommerce
+      POSTGRES_PASSWORD: ecommerce123
+      POSTGRES_DB: ecommerce
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ./database/image_db.sql:/docker-entrypoint-initdb.d/02-image_db.sql
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ecommerce"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    environment:
+      DATA_SOURCE_NAME: "postgresql://ecommerce:ecommerce123@postgres:5432/ecommerce?sslmode=disable"
+    ports:
+      - "9187:9187"
+    networks:
+      - ecommerce-network
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass luxe-cart-redis-password
+    environment:
+      REDIS_PASSWORD: luxe-cart-redis-password
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "luxe-cart-redis-password", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.55.0
+    environment:
+      REDIS_ADDR: "redis:6379"
+      REDIS_PASSWORD: "luxe-cart-redis-password"
+    ports:
+      - "9121:9121"
+    networks:
+      - ecommerce-network
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  # ─── MESSAGE QUEUE TIER ────────────────────────────────────────────────────
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+      - "15692:15692"
+    environment:
+      RABBITMQ_DEFAULT_USER: ecommerce
+      RABBITMQ_DEFAULT_PASS: ecommerce123
+      # RABBITMQ_ENABLED_PLUGINS: rabbitmq_management,rabbitmq_prometheus
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+      - ./monitoring/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf
+      - ./monitoring/rabbitmq-enabled-plugins:/etc/rabbitmq/enabled_plugins:ro
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 35s
+      timeout: 30s
+      retries: 10
+      start_period: 90s
+
+  # ─── SEARCH TIER ──────────────────────────────────────────────────────────
+
+  elasticsearch:
+    image: elasticsearch:8.13.4
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 20s
+      retries: 15
+      start_period: 120s
+
+  elasticsearch-exporter:
+    image: quay.io/prometheuscommunity/elasticsearch-exporter:v1.6.0
+    command:
+      - '--es.uri=http://elasticsearch:9200'
+      - '--es.all'
+    ports:
+      - "9114:9114"
+    networks:
+      - ecommerce-network
+    depends_on:
+      - elasticsearch
+    restart: unless-stopped
+
+  kibana:
+    image: kibana:8.13.4
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  # ─── DOCUMENT STORE (MongoDB for Email Service) ───────────────────────
+
+  mongodb:
+    image: mongo:7.0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb-data:/data/db
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 30s
+      timeout: 30s
+      retries: 10
+      start_period: 60s
+
+  mongodb-exporter:
+    image: percona/mongodb_exporter:0.40
+    command:
+      - '--mongodb.uri=mongodb://mongodb:27017'
+      - '--mongodb.direct-connect=true'
+      - '--discovering-mode'
+      - '--compatible-mode'
+    ports:
+      - "9216:9216"
+    networks:
+      - ecommerce-network
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─── MONITORING (Prometheus + Grafana) ─────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - ecommerce-network
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.2.2
+    ports:
+      - "3100:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=redis-datasource
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+      - loki
+    networks:
+      - ecommerce-network
+    restart: unless-stopped
+
+  # ─── LOG AGGREGATION (Loki + Promtail) ────────────────────────────────────
+
+  loki:
+    image: grafana/loki:2.9.10
+    ports:
+      - "3101:3100"
+    volumes:
+      - ./monitoring/loki-config.yml:/etc/loki/local-config.yaml
+      - loki-data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - ecommerce-network
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:latest
+    volumes:
+      - ./monitoring/promtail-config.yml:/etc/promtail/config.yml
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - ecommerce-network
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+  # ─── API GATEWAY TIER ──────────────────────────────────────────────────────
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: services/api-gateway-service/Dockerfile
+    ports:
+      - "18080:3000"  # api-gateway (host 18080 — avoiding Windows port conflicts)
+    environment:
+      - JWT_SECRET=your-secret-key-change-in-production
+      - REDIS_URL=redis://:luxe-cart-redis-password@redis:6379  # //redis://redis:6379
+      - RABBITMQ_URL=amqp://ecommerce:ecommerce123@rabbitmq:5672
+      - AUTH_SERVICE_URL=http://auth-service:3001
+      - USER_SERVICE_URL=http://user-service:3002
+      - PRODUCT_SERVICE_URL=http://product-service:3003
+      - CART_SERVICE_URL=http://cart-service:3004
+      - ORDER_SERVICE_URL=http://order-service:3005
+      - REVIEW_SERVICE_URL=http://review-service:3006
+      - RATING_SERVICE_URL=http://rating-service:3007
+      - PAYMENT_SERVICE_URL=http://payment-service:3008
+      - NOTIFICATION_SERVICE_URL=http://notification-service:3009
+      - ADMIN_SERVICE_URL=http://admin-service:3010
+      - INVENTORY_SERVICE_URL=http://inventory-service:3011
+      - SEARCH_SERVICE_URL=http://search-service:3012
+      - ANALYTICS_SERVICE_URL=http://analytics-service:3013
+      - RECOMMENDATION_SERVICE_URL=http://recommendation-service:3014
+      - EMAIL_SERVICE_URL=http://email-service:3015
+      - IMAGE_SERVICE_URL=http://image-service:3016
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  # ─── BUSINESS LOGIC TIER ──────────────────────────────────────────────────
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: services/auth-service/Dockerfile
+    environment:
+      - PORT=3001
+      - JWT_SECRET=your-secret-key-change-in-production
+      - DATABASE_URL=postgresql://ecommerce:ecommerce123@postgres:5432/ecommerce
+      - RABBITMQ_URL=amqp://ecommerce:ecommerce123@rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  user-service:
+    build:
+      context: .
+      dockerfile: services/user-service/Dockerfile
+    environment:
+      - PORT=3002
+      - DATABASE_URL=postgresql://ecommerce:ecommerce123@postgres:5432/ecommerce
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  product-service:
+    build:
+      context: .
+      dockerfile: services/product-service/Dockerfile
+    environment:
+      - PORT=3003
+      - DATABASE_URL=postgresql://ecommerce:ecommerce123@postgres:5432/ecommerce
+      - REDIS_URL=redis://:luxe-cart-redis-password@redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  cart-service:
+    build:
+      context: .
+      dockerfile: services/cart-service/Dockerfile
+    environment:
+      - PORT=3004
+      - DATABASE_URL=postgresql://ecommerce:ecommerce123@postgres:5432/ecommerce
+      - REDIS_URL=redis://:luxe-cart-redis-password@redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  order-service:
+    build:
+      context: .
+      dockerfile: services/order-service/Dockerfile
+    environment:
+      - PORT=3005
+      - DATABASE_URL=postgresql://ecommerce:ecommerce123@postgres:5432/ecommerce
+      - RABBITMQ_URL=amqp://ecommerce:ecommerce123@rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  review-service:
+    build:
+      context: .
+      dockerfile: services/review-service/Dockerfile
+    environment:
+      - PORT=3006
+      - DATABASE_URL=postgresql://ecommerce:ecommerce123@postgres:5432/ecommerce
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  rating-service:
+    build:
+      context: .
+      dockerfile: services/rating-service/Dockerfile
+    environment:
+      - PORT=3007
+      - DATABASE_URL=postgresql://ecommerce:ecommerce123@postgres:5432/ecommerce
+      - REDIS_URL=redis://:luxe-cart-redis-password@redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  payment-service:
+    build:
+      context: .
+      dockerfile: services/payment-service/Dockerfile
+    environment:
+      - PORT=3008
+      - DATABASE_URL=postgresql://ecommerce:ecommerce123@postgres:5432/ecommerce
+      - RABBITMQ_URL=amqp://ecommerce:ecommerce123@rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: services/notification-service/Dockerfile
+    environment:
+      - PORT=3009
+      - DATABASE_URL=postgresql://ecommerce:ecommerce123@postgres:5432/ecommerce
+      - RABBITMQ_URL=amqp://ecommerce:ecommerce123@rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  admin-service:
+    build:
+      context: .
+      dockerfile: services/admin-service/Dockerfile
+    environment:
+      - PORT=3010
+      - DATABASE_URL=postgresql://ecommerce:ecommerce123@postgres:5432/ecommerce
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  inventory-service:
+    build:
+      context: .
+      dockerfile: services/inventory-service/Dockerfile
+    environment:
+      - PORT=3011
+      - DATABASE_URL=postgresql://ecommerce:ecommerce123@postgres:5432/ecommerce
+      - RABBITMQ_URL=amqp://ecommerce:ecommerce123@rabbitmq:5672
+      - LOW_STOCK_THRESHOLD=10
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  search-service:
+    build:
+      context: .
+      dockerfile: services/search-service/Dockerfile
+    environment:
+      - PORT=3012
+      - DATABASE_URL=postgresql://ecommerce:ecommerce123@postgres:5432/ecommerce
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - RABBITMQ_URL=amqp://ecommerce:ecommerce123@rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  # ─── PYTHON SERVICES (Analytics, Recommendations, Email) ──────────────────
+
+  analytics-service:
+    build:
+      context: .
+      dockerfile: services/analytics-service/Dockerfile
+    environment:
+      - PORT=3013
+      - DATABASE_URL=postgresql://ecommerce:ecommerce123@postgres:5432/ecommerce
+    ports:
+      - "8013:3013"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  recommendation-service:
+    build:
+      context: .
+      dockerfile: services/recommendation-service/Dockerfile
+    environment:
+      - PORT=3014
+      - DATABASE_URL=postgresql://ecommerce:ecommerce123@postgres:5432/ecommerce
+      - REDIS_URL=redis://:luxe-cart-redis-password@redis:6379
+    ports:
+      - "8014:3014"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    restart: unless-stopped
+
+  email-service:
+    build:
+      context: .
+      dockerfile: services/email-service/Dockerfile
+    environment:
+      - PORT=3015
+      - MONGODB_URL=mongodb://mongodb:27017
+      - RABBITMQ_URL=amqp://ecommerce:ecommerce123@rabbitmq:5672
+      - SMTP_HOST=smtp.gmail.com
+      - SMTP_PORT=465
+      - SMTP_USER=
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-xxxx}
+      - FROM_EMAIL=LuxeCart <noreply@luxecart.com>
+    ports:
+      - "8015:3015"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    restart: unless-stopped
+
+  # ─── OBJECT STORAGE (LocalStack S3 for dev) ───────────────────────────────
+
+  localstack:
+    image: localstack/localstack:3.7
+    ports:
+      - "4566:4566"   # edge port — same inside and outside the network
+    environment:
+      - SERVICES=s3
+      - DEBUG=0
+      - AWS_DEFAULT_REGION=us-east-1
+      - PERSISTENCE=1
+    volumes:
+      - localstack-data:/var/lib/localstack
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # One-shot job that creates the bucket + sets CORS/policy on LocalStack
+  image-init:
+    image: amazon/aws-cli:2.17.30
+    entrypoint: ["/bin/sh", "/bootstrap.sh"]
+    environment:
+      - S3_ENDPOINT=http://localstack:4566
+      - AWS_REGION=us-east-1
+      - BUCKET=luxecart-images
+      - AWS_ACCESS_KEY_ID=xxx
+      - AWS_SECRET_ACCESS_KEY=xxx
+    volumes:
+      - ./infra/image-init/bootstrap.sh:/bootstrap.sh:ro
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    restart: "no"
+
+  # ─── IMAGE SERVICE (presigned uploads → S3 / LocalStack) ──────────────────
+
+  image-service:
+    build:
+      context: .
+      dockerfile: services/image-service/Dockerfile
+    environment:
+      - PORT=3016
+      - DATABASE_URL=postgresql://ecommerce:ecommerce123@postgres:5432/image_db
+      - S3_BUCKET_NAME=luxecart-images
+      - S3_ENDPOINT=http://localstack:4566          # inside the docker network
+      - S3_PRESIGN_ENDPOINT=http://localhost:4566   # what the browser sees
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=xxx
+      - AWS_SECRET_ACCESS_KEY=xxx
+      - PRESIGN_TTL_SECONDS=300
+      - MAX_UPLOAD_BYTES=5242880
+    ports:
+      - "18016:3016"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      image-init:
+        condition: service_completed_successfully
+    networks:
+      - ecommerce-network
+    restart: unless-stopped
+
+  # ─── PRESENTATION TIER (Next.js 15) ───────────────────────────────────────
+
+  frontend-v2:
+    build:
+      context: ./frontend-v2
+      args:
+        # Browser hits the gateway on the host, not inside the docker network
+        NEXT_PUBLIC_API_URL: http://localhost:18080
+    ports:
+      - "18081:3000"  # frontend-v2 (host 18081 — avoiding Windows port conflicts)
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=http://localhost:18080
+    depends_on:
+      - api-gateway
+    networks:
+      - ecommerce-network
+    restart: unless-stopped
+
+networks:
+  ecommerce-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  rabbitmq-data:
+  elasticsearch-data:
+  mongodb-data:
+  prometheus-data:
+  grafana-data:
+  loki-data:
+  localstack-data:

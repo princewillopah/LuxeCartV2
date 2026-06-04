@@ -95,8 +95,3 @@ scrape_configs:
   - job_name: 'email-service'
     static_configs:
       - targets: ['email-service:3015']
-
-  # Frontend (Nginx)
-  - job_name: 'frontend'
-    static_configs:
-      - targets: ['nginx-exporter:9113']

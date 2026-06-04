@@ -1,5 +1,6 @@
 
-```
+```bash
+# latest
 LuxeCart-App-build-Pipeline
 │
 ├── frontend

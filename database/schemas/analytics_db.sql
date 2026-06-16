@@ -1,0 +1,12 @@
+-- analytics_db.sql / recommendation_db.sql — placeholder.
+--
+-- The analytics-service and recommendation-service create their own
+-- projection tables at startup inside a dedicated Postgres schema
+-- (`analytics` / `recommendation`). They populate from Kafka events
+-- (`product.*`, `order.*`, `user.*`) and a one-shot backfill from
+-- `public.*` on first run.
+--
+-- No DDL is needed here — the services own their schema definitions
+-- in code (services/analytics-service/main.py PROJECTION_DDL and
+-- services/recommendation-service/main.py PROJECTION_DDL). This file
+-- only documents that the database is owned by exactly one service.

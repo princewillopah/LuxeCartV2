@@ -1,0 +1,98 @@
+# ─── Server ─────────────────────────────────────────────────────────────
+# Port matches the legacy Node service so docker-compose, the gateway,
+# and every internal caller (inventory-service, etc.) keep working
+# without any other changes.
+server:
+  port: ${SERVER_PORT:3003}
+
+spring:
+  application:
+    name: product-service
+
+  # ─── DataSource ──────────────────────────────────────────────────────
+  # The compose file passes JDBC-form URL + creds via SPRING_DATASOURCE_*
+  # env vars (Spring Boot 3 auto-binds those). The defaults below let
+  # the app boot locally without docker.
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://postgres:5432/ecommerce}
+    username: ${SPRING_DATASOURCE_USERNAME:ecommerce}
+    password: ${SPRING_DATASOURCE_PASSWORD:ecommerce}
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+
+  # ─── JPA / Hibernate ─────────────────────────────────────────────────
+  # `ddl-auto=none` because the canonical schema lives in
+  # database/schema.sql and is applied by docker-compose init.
+  # Dialect is auto-detected from the JDBC URL; declaring it explicitly
+  # triggers a Hibernate deprecation warning, so we leave it off.
+  jpa:
+    hibernate:
+      ddl-auto: none
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+    open-in-view: false
+
+  # ─── Redis (Lettuce) ─────────────────────────────────────────────────
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:redis}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+      password: ${SPRING_DATA_REDIS_PASSWORD:}
+      timeout: 2000ms
+
+  # ─── Cache (Redis-backed) ────────────────────────────────────────────
+  # Per-cache TTLs are configured in RedisCacheConfig so the public list
+  # cache mirrors the 5-min TTL of the Node implementation.
+  cache:
+    type: redis
+
+  # ─── Kafka producer ──────────────────────────────────────────────────
+  # We publish product.created / product.updated / product.deleted on
+  # the topic naming scheme `ecommerce.product.<event>` so sibling
+  # services (search-service, recommendation-service, analytics-service)
+  # can react under the database-per-service split. Bootstrap servers
+  # come from the standard KAFKA_BROKERS env var the other services use.
+  kafka:
+    bootstrap-servers: ${KAFKA_BROKERS:kafka:9092}
+    producer:
+      acks: all
+      key-serializer:   org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        spring.json.add.type.headers: false
+
+  # ─── Jackson ─────────────────────────────────────────────────────────
+  # Omit null fields and serialize Instant as ISO-8601 (not as a numeric
+  # timestamp) so the JSON shape matches what the React frontend expects.
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+    default-property-inclusion: non_null
+
+# ─── Actuator ───────────────────────────────────────────────────────────
+# Expose only what we need; the gateway forwards /metrics and /health to
+# these endpoints (see HealthController + MetricsController shims).
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: never
+    prometheus:
+      access: read_only
+  metrics:
+    tags:
+      service: product-service
+
+# ─── Logging ────────────────────────────────────────────────────────────
+logging:
+  level:
+    root: INFO
+    org.springframework.web: INFO
+    com.luxecart.product: DEBUG

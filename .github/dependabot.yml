@@ -1,0 +1,71 @@
+# Dependabot — automated dependency updates + security alerts.
+# Grouped to keep PR noise low (minor+patch bundled per ecosystem).
+# Enable "Dependabot alerts" + "security updates" in repo Settings → Security
+# for the CVE side; this file drives the version-update PRs.
+version: 2
+updates:
+  # ── Node services + frontend (npm) ──────────────────────────────────────
+  - package-ecosystem: npm
+    directories:
+      - "/app/backend-services/*"   # only dirs with package.json are picked up
+      - "/app/frontend"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+
+  # ── Python services (pip) ───────────────────────────────────────────────
+  - package-ecosystem: pip
+    directories:
+      - "/app/backend-services/analytics-service"
+      - "/app/backend-services/email-service"
+      - "/app/backend-services/recommendation-service"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      pip-minor-patch:
+        update-types: [minor, patch]
+
+  # ── Go (payment-service-go) ─────────────────────────────────────────────
+  - package-ecosystem: gomod
+    directory: "/app/backend-services/payment-service-go"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+
+  # ── Java / Maven (product-service) ──────────────────────────────────────
+  - package-ecosystem: maven
+    directory: "/app/backend-services/product-service"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+
+  # ── Dockerfiles (base image bumps) ──────────────────────────────────────
+  - package-ecosystem: docker
+    directories:
+      - "/app/backend-services/*"
+      - "/app/frontend"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      docker-base:
+        patterns: ["*"]
+
+  # ── GitHub Actions versions ─────────────────────────────────────────────
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]

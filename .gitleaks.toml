@@ -1,0 +1,20 @@
+# gitleaks config — extends the built-in ruleset, then allowlists the test /
+# example credentials that legitimately live in this repo (Paystack/Flutterwave
+# TEST keys, .env.example). Picked up automatically by gitleaks-action.
+title = "LuxeCart gitleaks"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test/example credentials and fixtures (not real secrets)"
+paths = [
+  '''.*\.example$''',
+  '''app/\.env\.example''',
+  '''.*\.md$''',
+]
+regexes = [
+  '''FLWSECK_TEST-[A-Za-z0-9-]+''',
+  '''FLWPUBK_TEST-[A-Za-z0-9-]+''',
+  '''(sk|pk)_test_[A-Za-z0-9]+''',
+]

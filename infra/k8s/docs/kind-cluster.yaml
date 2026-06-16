@@ -1,0 +1,56 @@
+# kind cluster config — luxecart-dev
+#
+# - 3 nodes (1 control-plane + 2 workers) so HPA / topologySpread / PDB
+#   actually have somewhere to spread to.
+# - Pinned to k8s v1.30.0 (matches kubectl v1.30.5 we installed).
+# - extraPortMappings on the control plane bind host ports to the kind node
+#   so ingress-nginx → host networking works without `kubectl port-forward`.
+#   Host :18080 → cluster :80 (HTTP via ingress)
+#   Host :18443 → cluster :443 (HTTPS via ingress)
+#   Host :18090 → cluster :30090 (Grafana NodePort for local dev)
+# - Disable the default-deny PSS profile at the cluster level — we will
+#   apply `restricted` per namespace (B.1) which is more precise.
+#
+# To create:    kind create cluster --name luxecart-dev --config infra/k8s/docs/kind-cluster.yaml
+# To delete:    kind delete cluster --name luxecart-dev
+# To export kubeconfig: kind export kubeconfig --name luxecart-dev
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: luxecart-dev
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.30.0
+    kubeadmConfigPatches:
+      # Label this node so ingress-nginx can pin to it via nodeSelector.
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 18080
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 18443
+        protocol: TCP
+      # Grafana NodePort for quick browser access (no port-forward needed).
+      - containerPort: 30090
+        hostPort: 18090
+        protocol: TCP
+  - role: worker
+    image: kindest/node:v1.30.0
+  - role: worker
+    image: kindest/node:v1.30.0
+
+# Use the default kindnet CNI. For NetworkPolicy enforcement we'll either
+# swap to Calico in K1 or rely on kindnet's basic policy support (kindnet
+# does NOT enforce NetworkPolicy by default — note this for K1 setup).
+networking:
+  # Enabling explicit pod/service subnets so we know exactly what to put
+  # in NetworkPolicy CIDR rules later.
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/16"
+  # Disable kube-proxy in favour of nothing fancy — default iptables mode
+  # is fine for dev. (When we add Cilium or Calico we'll set kubeProxyMode: none.)

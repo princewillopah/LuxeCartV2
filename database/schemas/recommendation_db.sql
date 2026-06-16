@@ -1,0 +1,2 @@
+-- recommendation_db.sql — see analytics_db.sql.
+-- Schema is owned by services/recommendation-service/main.py PROJECTION_DDL.

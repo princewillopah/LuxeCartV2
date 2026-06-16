@@ -1,0 +1,30 @@
+# Local-dev helpers for the Go payment-service.
+# Run `just` from this folder to see all tasks.
+
+# Default: list tasks.
+default:
+    @just --list
+
+# Tidy & vendor Go modules.
+tidy:
+    cd {{justfile_directory()}} && go mod tidy
+
+# Build the binary locally (no Docker).
+build:
+    cd {{justfile_directory()}} && go build -o ./bin/server ./cmd/server
+
+# Run vet + go test (no tests yet, but plumbing is ready).
+test:
+    cd {{justfile_directory()}} && go vet ./... && go test ./...
+
+# Build the Docker image standalone.
+image:
+    docker build -t luxecart/payment-service-go:dev {{justfile_directory()}}
+
+# Bring up the service via the project's docker-compose.
+up:
+    cd {{justfile_directory()}}/../.. && docker compose up -d --build payment-service-go
+
+# Show last 100 lines of logs.
+logs:
+    cd {{justfile_directory()}}/../.. && docker compose logs --tail=100 payment-service-go

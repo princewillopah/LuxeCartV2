@@ -1,0 +1,60 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# OWASP ZAP — DAST (dynamic scan) against a RUNNING deployment.
+#
+# Unlike the other scans, ZAP needs a live target, so this workflow is manual
+# (workflow_dispatch) + weekly. Point it at a staging / preview environment —
+# NOT production (a baseline scan is passive, but the full scan is active).
+#
+# Default target is the dev gateway from infra notes; override via the `target`
+# input or a TARGET_URL repo variable. The baseline scan is passive/quick;
+# flip `scan_type` to "full" for an active attack scan.
+# ─────────────────────────────────────────────────────────────────────────────
+name: ZAP DAST
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Target URL to scan"
+        required: false
+        default: ""
+      scan_type:
+        description: "baseline (passive) or full (active)"
+        required: false
+        default: "baseline"
+        type: choice
+        options: [baseline, full]
+  schedule:
+    - cron: "37 4 * * 1"   # Mondays 04:37 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  zap:
+    name: ZAP ${{ github.event.inputs.scan_type || 'baseline' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write   # ZAP opens/updates a tracking issue for findings
+    env:
+      TARGET: ${{ github.event.inputs.target || vars.TARGET_URL || 'http://4.180.228.58.nip.io:18080' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ZAP baseline scan
+        if: ${{ (github.event.inputs.scan_type || 'baseline') == 'baseline' }}
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ env.TARGET }}
+          cmd_options: "-a"          # include alpha passive rules
+          fail_action: false         # report-only; flip to true to gate
+          allow_issue_writing: true
+
+      - name: ZAP full scan
+        if: ${{ github.event.inputs.scan_type == 'full' }}
+        uses: zaproxy/action-full-scan@v0.12.0
+        with:
+          target: ${{ env.TARGET }}
+          fail_action: false
+          allow_issue_writing: true

@@ -1,0 +1,218 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Reusable per-service pipeline (called by ci.yml for each changed service).
+#
+# Stage order enforces "scan before push":
+#   1. unit tests / lint (language-specific; non-blocking placeholders until
+#      real tests land — see TEST STAGE notes)
+#   2. gitleaks secret scan (source)
+#   3. docker build --load   (image built locally, NOT pushed yet)
+#   4. Trivy image scan      → SARIF → GitHub code-scanning
+#   5. Snyk container test    (only if SNYK_TOKEN is configured)
+#   6. push to GHCR           (only when inputs.push == true, i.e. main)
+#
+# Security gates are currently `continue-on-error: true` so the pipeline is
+# usable from day one and findings surface in the Security tab. To make them
+# BLOCKING, remove the `continue-on-error: true` lines on the Trivy/Snyk/
+# gitleaks steps (and set Trivy `exit-code: '1'`).
+# ─────────────────────────────────────────────────────────────────────────────
+name: service-ci
+
+on:
+  workflow_call:
+    inputs:
+      service:    { type: string, required: true,  description: "Service folder name" }
+      lang:       { type: string, required: true,  description: "node | python | go | java | nextjs" }
+      path:       { type: string, required: true,  description: "Source dir (working dir for tests)" }
+      context:    { type: string, required: true,  description: "Docker build context" }
+      dockerfile: { type: string, required: true,  description: "Dockerfile path" }
+      image:      { type: string, required: true,  description: "Image name without registry/owner" }
+      port:       { type: string, required: false, default: "" }
+      node:       { type: string, required: false, default: "20" }
+      python:     { type: string, required: false, default: "3.11" }
+      go:         { type: string, required: false, default: "1.24" }
+      java:       { type: string, required: false, default: "21" }
+      push:       { type: boolean, required: false, default: false }
+    secrets:
+      SNYK_TOKEN: { required: false }
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+jobs:
+  build:
+    name: ${{ inputs.service }}
+    runs-on: ubuntu-latest
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── 1. unit tests / lint ─────────────────────────────────────────────
+      - name: Setup Node
+        if: ${{ inputs.lang == 'node' || inputs.lang == 'nextjs' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.path }}/package-lock.json
+
+      - name: Node install + lint + test
+        if: ${{ inputs.lang == 'node' || inputs.lang == 'nextjs' }}
+        working-directory: ${{ inputs.path }}
+        run: |
+          npm ci
+          npm run lint --if-present
+          npm run typecheck --if-present
+          # TEST STAGE: skips cleanly until a "test" script exists.
+          npm test --if-present
+
+      - name: Setup Python
+        if: ${{ inputs.lang == 'python' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.path }}/requirements.txt
+
+      - name: Python install + test
+        if: ${{ inputs.lang == 'python' }}
+        working-directory: ${{ inputs.path }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+          # TEST STAGE: pytest exit code 5 == "no tests collected" → treat as pass.
+          pytest -q; rc=$?; if [ "$rc" -eq 5 ]; then echo "no tests yet — skipping"; elif [ "$rc" -ne 0 ]; then exit "$rc"; fi
+
+      - name: Setup Go
+        if: ${{ inputs.lang == 'go' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go }}
+          cache-dependency-path: ${{ inputs.path }}/go.sum
+
+      - name: Go vet + test
+        if: ${{ inputs.lang == 'go' }}
+        working-directory: ${{ inputs.path }}
+        run: |
+          go vet ./...
+          go test ./...   # passes with no _test.go files
+
+      - name: Setup Java
+        if: ${{ inputs.lang == 'java' }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java }}
+          cache: maven
+
+      - name: Maven test
+        if: ${{ inputs.lang == 'java' }}
+        working-directory: ${{ inputs.path }}
+        run: mvn -B -q test   # runs zero tests cleanly until src/test is added
+
+      # ── 2. secret scan ───────────────────────────────────────────────────
+      - name: Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+
+      # ── 3. build image (load, not pushed) ────────────────────────────────
+      - name: Resolve image ref
+        id: ref
+        run: |
+          owner="${{ github.repository_owner }}"
+          echo "image=ghcr.io/${owner,,}/${{ inputs.image }}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (local, for scanning)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          load: true
+          tags: ${{ steps.ref.outputs.image }}:scan
+          cache-from: type=gha,scope=${{ inputs.service }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.service }}
+          # Only the Next.js image consumes these; backend builds ignore them.
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL || 'http://localhost:3000' }}
+            SITE_URL=${{ vars.SITE_URL || 'http://localhost:3000' }}
+
+      # ── 4. Trivy image scan ──────────────────────────────────────────────
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        continue-on-error: true
+        with:
+          image-ref: ${{ steps.ref.outputs.image }}:scan
+          format: sarif
+          output: trivy-${{ inputs.service }}.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          vuln-type: os,library
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ inputs.service }}.sarif
+          category: trivy-${{ inputs.service }}
+
+      # ── 5. Snyk container test (optional) ────────────────────────────────
+      - name: Snyk container test
+        if: ${{ env.SNYK_TOKEN != '' }}
+        continue-on-error: true
+        uses: snyk/actions/docker@master
+        with:
+          image: ${{ steps.ref.outputs.image }}:scan
+          args: --severity-threshold=high --file=${{ inputs.dockerfile }}
+
+      - name: Upload Snyk SARIF
+        if: ${{ env.SNYK_TOKEN != '' }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk.sarif
+          category: snyk-${{ inputs.service }}
+
+      # ── 6. push to GHCR (main only) ──────────────────────────────────────
+      - name: Login to GHCR
+        if: ${{ inputs.push }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Docker metadata
+        if: ${{ inputs.push }}
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.ref.outputs.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+
+      - name: Build & push to GHCR
+        if: ${{ inputs.push }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ inputs.service }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.service }}
+          provenance: true
+          sbom: true
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL || 'http://localhost:3000' }}
+            SITE_URL=${{ vars.SITE_URL || 'http://localhost:3000' }}

@@ -1,0 +1,485 @@
+"""
+Recommendation Service — Port 3014
+
+Provides personalized product recommendations:
+- Collaborative filtering (users who bought X also bought Y)
+- Content-based filtering (similar products)
+- Trending products (popularity-based)
+- Recently viewed (user history in Redis)
+
+Tech: FastAPI + Redis + PostgreSQL
+"""
+
+from fastapi import FastAPI, HTTPException, Query
+from shared_logger import setup_logging, RequestContextMiddleware
+
+from fastapi.middleware.cors import CORSMiddleware
+from typing import List, Dict, Any, Optional
+from collections import defaultdict, Counter
+import asyncpg
+from redis import asyncio as aioredis
+import json
+import os
+import logging
+from datetime import datetime, timedelta
+from prometheus_client import Counter as PromCounter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from starlette.responses import Response
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Recommendation Service", version="1.0.0")
+
+
+# Structured logging — every line is JSON with service + request_id
+_svc_logger = setup_logging('recommendation-service')
+app.add_middleware(RequestContextMiddleware, service_name='recommendation-service')
+
+# Prometheus metrics
+REQUEST_COUNT = PromCounter('http_requests_total', 'Total HTTP requests', ['service', 'method', 'endpoint', 'status'])
+REQUEST_LATENCY = Histogram('http_request_duration_seconds', 'HTTP request latency', ['service', 'method', 'endpoint'])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Prometheus middleware
+@app.middleware("http")
+async def track_metrics(request, call_next):
+    import time
+    start_time = time.time()
+    response = await call_next(request)
+    duration = time.time() - start_time
+    
+    REQUEST_COUNT.labels("recommendation-service", request.method, request.url.path, response.status_code).inc()
+    REQUEST_LATENCY.labels("recommendation-service", request.method, request.url.path).observe(duration)
+    
+    return response
+
+# Connections
+db_pool = None
+redis_client = None
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://ecommerce:ecommerce123@postgres:5432/ecommerce"
+)
+REDIS_URL = os.getenv("REDIS_URL", "redis://:some-default-password-here@redis:6379")
+
+
+@app.on_event("startup")
+async def startup():
+    global db_pool, redis_client
+    
+    # PostgreSQL
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+        logger.info("✅ Recommendation Service connected to PostgreSQL")
+    except Exception as e:
+        logger.error(f"❌ PostgreSQL connection failed: {e}")
+        raise
+    
+    # Redis
+    try:
+        redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+        await redis_client.ping()
+        logger.info("✅ Recommendation Service connected to Redis")
+    except Exception as e:
+        logger.error(f"❌ Redis connection failed: {e}")
+        raise
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if db_pool:
+        await db_pool.close()
+    if redis_client:
+        await redis_client.close()
+
+
+@app.get("/health")
+async def health():
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        await redis_client.ping()
+        return {
+            "status": "healthy",
+            "service": "Recommendations",
+            "database": "connected",
+            "redis": "connected"
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return {
+            "status": "unhealthy",
+            "service": "Recommendations",
+            "error": str(e)
+        }
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint"""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# COLLABORATIVE FILTERING
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@app.get("/recommendations/collaborative/{product_id}")
+async def collaborative_recommendations(
+    product_id: int,
+    limit: int = Query(6, ge=1, le=20)
+):
+    """
+    Users who bought this product also bought...
+    
+    Algorithm:
+    1. Find all users who bought this product
+    2. Find all other products those users bought
+    3. Rank by frequency
+    4. Return top N (excluding the input product)
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            # Get users who bought this product
+            user_orders = await conn.fetch("""
+                SELECT DISTINCT o.user_id
+                FROM orders o
+                JOIN order_items oi ON o.id = oi.order_id
+                WHERE oi.product_id = $1
+                  AND o.status IN ('completed', 'shipped', 'delivered')
+            """, product_id)
+            
+            if not user_orders:
+                return {"product_id": product_id, "recommendations": []}
+            
+            user_ids = [row['user_id'] for row in user_orders]
+            
+            # Find other products these users bought
+            related = await conn.fetch("""
+                SELECT 
+                    p.id,
+                    p.name,
+                    p.description,
+                    p.price,
+                    p.category,
+                    p.images,
+                    p.average_rating,
+                    p.stock,
+                    COUNT(DISTINCT o.user_id) as co_purchase_count
+                FROM products p
+                JOIN order_items oi ON p.id = oi.product_id
+                JOIN orders o ON oi.order_id = o.id
+                WHERE o.user_id = ANY($1::int[])
+                  AND o.status IN ('completed', 'shipped', 'delivered')
+                  AND p.id != $2
+                  AND p.stock > 0
+                GROUP BY p.id
+                ORDER BY co_purchase_count DESC, p.average_rating DESC
+                LIMIT $3
+            """, user_ids, product_id, limit)
+            
+            return {
+                "product_id": product_id,
+                "algorithm": "collaborative_filtering",
+                "recommendations": [
+                    {
+                        "id": row['id'],
+                        "name": row['name'],
+                        "description": row['description'],
+                        "price": float(row['price']),
+                        "category": row['category'],
+                        "images": row['images'],
+                        "average_rating": float(row['average_rating']) if row['average_rating'] else 0,
+                        "stock": row['stock'],
+                        "relevance_score": row['co_purchase_count']
+                    }
+                    for row in related
+                ]
+            }
+    except Exception as e:
+        logger.error(f"Collaborative recommendations error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CONTENT-BASED FILTERING
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@app.get("/recommendations/similar/{product_id}")
+async def similar_products(
+    product_id: int,
+    limit: int = Query(6, ge=1, le=20)
+):
+    """
+    Find similar products based on category, price range, rating
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            # Get the source product
+            source = await conn.fetchrow("""
+                SELECT category, price, average_rating
+                FROM products
+                WHERE id = $1
+            """, product_id)
+            
+            if not source:
+                raise HTTPException(status_code=404, detail="Product not found")
+            
+            # Find similar products
+            similar = await conn.fetch("""
+                SELECT 
+                    id, name, description, price, category,
+                    images, average_rating, stock,
+                    ABS(price - $2) as price_diff
+                FROM products
+                WHERE category = $1
+                  AND id != $3
+                  AND stock > 0
+                ORDER BY 
+                    price_diff ASC,
+                    average_rating DESC
+                LIMIT $4
+            """, source['category'], float(source['price']), product_id, limit)
+            
+            return {
+                "product_id": product_id,
+                "algorithm": "content_based_filtering",
+                "recommendations": [
+                    {
+                        "id": row['id'],
+                        "name": row['name'],
+                        "description": row['description'],
+                        "price": float(row['price']),
+                        "category": row['category'],
+                        "images": row['images'],
+                        "average_rating": float(row['average_rating']) if row['average_rating'] else 0,
+                        "stock": row['stock']
+                    }
+                    for row in similar
+                ]
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Similar products error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TRENDING PRODUCTS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@app.get("/recommendations/trending")
+async def trending_products(
+    days: int = Query(7, ge=1, le=30),
+    limit: int = Query(10, ge=1, le=50)
+):
+    """
+    Trending products based on recent orders
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            since_date = datetime.now() - timedelta(days=days)
+            
+            results = await conn.fetch("""
+                SELECT 
+                    p.id,
+                    p.name,
+                    p.description,
+                    p.price,
+                    p.category,
+                    p.images,
+                    p.average_rating,
+                    p.stock,
+                    COUNT(DISTINCT o.id) as order_count,
+                    SUM(oi.quantity) as units_sold
+                FROM products p
+                JOIN order_items oi ON p.id = oi.product_id
+                JOIN orders o ON oi.order_id = o.id
+                WHERE o.created_at >= $1
+                  AND o.status IN ('completed', 'shipped', 'delivered')
+                  AND p.stock > 0
+                GROUP BY p.id
+                ORDER BY units_sold DESC, order_count DESC
+                LIMIT $2
+            """, since_date, limit)
+            
+            return {
+                "period_days": days,
+                "trending": [
+                    {
+                        "id": row['id'],
+                        "name": row['name'],
+                        "description": row['description'],
+                        "price": float(row['price']),
+                        "category": row['category'],
+                        "images": row['images'],
+                        "average_rating": float(row['average_rating']) if row['average_rating'] else 0,
+                        "stock": row['stock'],
+                        "order_count": row['order_count'],
+                        "units_sold": row['units_sold']
+                    }
+                    for row in results
+                ]
+            }
+    except Exception as e:
+        logger.error(f"Trending products error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# PERSONALIZED RECOMMENDATIONS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@app.get("/recommendations/for-user/{user_id}")
+async def recommendations_for_user(
+    user_id: int,
+    limit: int = Query(10, ge=1, le=50)
+):
+    """
+    Personalized recommendations for a user based on their order history
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            # Get user's purchase history (categories and products)
+            history = await conn.fetch("""
+                SELECT DISTINCT p.category, oi.product_id
+                FROM orders o
+                JOIN order_items oi ON o.id = oi.order_id
+                JOIN products p ON oi.product_id = p.id
+                WHERE o.user_id = $1
+                  AND o.status IN ('completed', 'shipped', 'delivered')
+            """, user_id)
+            
+            if not history:
+                # New user — return trending
+                trending = await trending_products(days=7, limit=limit)
+                return {
+                    "user_id": user_id,
+                    "algorithm": "trending_fallback",
+                    "recommendations": trending['trending']
+                }
+            
+            purchased_ids = [row['product_id'] for row in history]
+            categories = list(set([row['category'] for row in history]))
+            
+            # Recommend products from same categories NOT yet purchased
+            results = await conn.fetch("""
+                SELECT 
+                    id, name, description, price, category,
+                    images, average_rating, stock
+                FROM products
+                WHERE category = ANY($1::text[])
+                  AND id != ALL($2::int[])
+                  AND stock > 0
+                ORDER BY average_rating DESC, total_reviews DESC
+                LIMIT $3
+            """, categories, purchased_ids, limit)
+            
+            return {
+                "user_id": user_id,
+                "algorithm": "personalized_category_based",
+                "favorite_categories": categories,
+                "recommendations": [
+                    {
+                        "id": row['id'],
+                        "name": row['name'],
+                        "description": row['description'],
+                        "price": float(row['price']),
+                        "category": row['category'],
+                        "images": row['images'],
+                        "average_rating": float(row['average_rating']) if row['average_rating'] else 0,
+                        "stock": row['stock']
+                    }
+                    for row in results
+                ]
+            }
+    except Exception as e:
+        logger.error(f"User recommendations error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# RECENTLY VIEWED (Redis-based)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@app.post("/recommendations/track-view")
+async def track_product_view(user_id: int, product_id: int):
+    """
+    Track that a user viewed a product (store in Redis)
+    """
+    try:
+        key = f"viewed:{user_id}"
+        # Add to sorted set with timestamp as score
+        await redis_client.zadd(key, {str(product_id): datetime.now().timestamp()})
+        # Keep only last 50 views
+        await redis_client.zremrangebyrank(key, 0, -51)
+        # Set 30-day expiry
+        await redis_client.expire(key, 30 * 24 * 60 * 60)
+        
+        return {"status": "tracked", "user_id": user_id, "product_id": product_id}
+    except Exception as e:
+        logger.error(f"Track view error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/recommendations/recently-viewed/{user_id}")
+async def recently_viewed(user_id: int, limit: int = Query(10, ge=1, le=50)):
+    """
+    Get recently viewed products for a user
+    """
+    try:
+        key = f"viewed:{user_id}"
+        # Get product IDs (most recent first)
+        product_ids = await redis_client.zrevrange(key, 0, limit - 1)
+        
+        if not product_ids:
+            return {"user_id": user_id, "recently_viewed": []}
+        
+        # Convert to integers
+        product_ids = [int(pid) for pid in product_ids]
+        
+        # Fetch product details
+        async with db_pool.acquire() as conn:
+            results = await conn.fetch("""
+                SELECT id, name, description, price, category, images, average_rating, stock
+                FROM products
+                WHERE id = ANY($1::int[])
+            """, product_ids)
+            
+            # Maintain order from Redis
+            products_dict = {row['id']: row for row in results}
+            ordered_products = [products_dict[pid] for pid in product_ids if pid in products_dict]
+            
+            return {
+                "user_id": user_id,
+                "recently_viewed": [
+                    {
+                        "id": row['id'],
+                        "name": row['name'],
+                        "description": row['description'],
+                        "price": float(row['price']),
+                        "category": row['category'],
+                        "images": row['images'],
+                        "average_rating": float(row['average_rating']) if row['average_rating'] else 0,
+                        "stock": row['stock']
+                    }
+                    for row in ordered_products
+                ]
+            }
+    except Exception as e:
+        logger.error(f"Recently viewed error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=3014)

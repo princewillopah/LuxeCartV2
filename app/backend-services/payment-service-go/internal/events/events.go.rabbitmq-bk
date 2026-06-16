@@ -1,0 +1,167 @@
+// Package events publishes payment-lifecycle events onto RabbitMQ.
+//
+// The exchange/queue topology was set up by the Node services; we just join
+// the same fanout pattern so the email-service (and any future consumer)
+// keeps receiving payment.completed / payment.failed exactly as before.
+//
+// The publisher is intentionally fire-and-forget: callers log the error but
+// don't fail the HTTP response if MQ is down — the DB is the source of truth
+// and the order/payment state is already correct.
+package events
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+)
+
+// Exchange settings MUST match what the Node services declare in
+// services/shared/eventBus.js — same name, same type, same durable flag.
+// If any of these differ, RabbitMQ rejects ExchangeDeclare with
+// PRECONDITION_FAILED.
+const exchange = "ecommerce.events"
+
+// Publisher owns a single long-lived connection + channel. Reconnect on
+// error so transient MQ blips don't take us down permanently.
+type Publisher struct {
+	url string
+	log *slog.Logger
+
+	mu   sync.Mutex
+	conn *amqp.Connection
+	ch   *amqp.Channel
+}
+
+func New(url string, log *slog.Logger) *Publisher {
+	return &Publisher{url: url, log: log}
+}
+
+// Connect (re)establishes the connection + channel and re-declares the
+// exchange. Safe to call multiple times.
+func (p *Publisher) Connect() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.connectLocked()
+}
+
+func (p *Publisher) connectLocked() error {
+	if p.conn != nil && !p.conn.IsClosed() && p.ch != nil {
+		return nil
+	}
+	conn, err := amqp.Dial(p.url)
+	if err != nil {
+		return fmt.Errorf("rabbitmq dial: %w", err)
+	}
+	ch, err := conn.Channel()
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("rabbitmq channel: %w", err)
+	}
+	if err := ch.ExchangeDeclare(
+		exchange, "topic",
+		true,  // durable
+		false, // autoDelete
+		false, // internal
+		false, // noWait
+		nil,
+	); err != nil {
+		_ = ch.Close()
+		_ = conn.Close()
+		return fmt.Errorf("rabbitmq exchange declare: %w", err)
+	}
+	p.conn = conn
+	p.ch = ch
+	return nil
+}
+
+// Close tears down the connection on shutdown.
+func (p *Publisher) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ch != nil {
+		_ = p.ch.Close()
+		p.ch = nil
+	}
+	if p.conn != nil {
+		_ = p.conn.Close()
+		p.conn = nil
+	}
+}
+
+// envelope matches the format used by the Node services so existing consumers
+// don't need to change. See services/shared/eventBus.js publishEvent().
+type envelope struct {
+	Event     string `json:"event"`
+	Data      any    `json:"data"`
+	Timestamp string `json:"timestamp"`
+	MessageID string `json:"messageId"`
+}
+
+// Publish marshals data as JSON and sends it to the topic exchange with the
+// event type as the routing key. Tolerates transient connection loss by
+// reconnecting once.
+func (p *Publisher) Publish(ctx context.Context, eventType string, data any) error {
+	body, err := json.Marshal(envelope{
+		Event:     eventType,
+		Data:      data,
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		MessageID: fmt.Sprintf("%s-%d-%s", eventType, time.Now().UnixMilli(), randSuffix()),
+	})
+	if err != nil {
+		return fmt.Errorf("marshal event: %w", err)
+	}
+
+	publish := func() error {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if err := p.connectLocked(); err != nil {
+			return err
+		}
+		// Topic exchange — routing key is the event type so consumers can
+		// bind with patterns like "payment.*" or "order.created".
+		return p.ch.PublishWithContext(ctx,
+			exchange, eventType,
+			false, false,
+			amqp.Publishing{
+				ContentType:  "application/json",
+				DeliveryMode: amqp.Persistent,
+				Timestamp:    time.Now(),
+				Body:         body,
+			},
+		)
+	}
+
+	if err := publish(); err != nil {
+		p.log.Warn("publish failed; reconnecting and retrying", "err", err, "event", eventType)
+		// Force a reconnect by dropping current handles, then try once more.
+		p.mu.Lock()
+		if p.ch != nil {
+			_ = p.ch.Close()
+			p.ch = nil
+		}
+		if p.conn != nil {
+			_ = p.conn.Close()
+			p.conn = nil
+		}
+		p.mu.Unlock()
+		if err := publish(); err != nil {
+			return err
+		}
+	}
+	p.log.Info("event published", "event", eventType)
+	return nil
+}
+
+// randSuffix returns a short random hex tag for messageId uniqueness.
+func randSuffix() string {
+	var b [3]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}

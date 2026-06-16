@@ -1,0 +1,93 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# LuxeCart CI — build, test, scan and publish every changed service image.
+#
+#   changes  → diff against base, build the matrix from .github/services.json
+#   build    → per changed service: test → secret-scan → build → Trivy → push
+#   sonarcloud → one repo-wide SAST pass (needs SONAR_TOKEN)
+#
+# Images are pushed to GHCR only on push to main. PRs run the full
+# test+scan gauntlet but do NOT push. CodeQL, ZAP and Dependabot live in
+# their own workflows/configs.
+# ─────────────────────────────────────────────────────────────────────────────
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}   # manual run rebuilds every service
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect changed services
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      any: ${{ steps.set.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compute matrix
+        id: set
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: python3 .github/scripts/changed_services.py
+
+  build:
+    name: build
+    needs: changes
+    if: ${{ needs.changes.outputs.any == 'true' }}
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
+    uses: ./.github/workflows/_service-ci.yml
+    with:
+      service: ${{ matrix.name }}
+      lang: ${{ matrix.lang }}
+      path: ${{ matrix.path }}
+      context: ${{ matrix.context }}
+      dockerfile: ${{ matrix.dockerfile }}
+      image: ${{ matrix.image }}
+      port: ${{ matrix.port }}
+      node: ${{ matrix.node }}
+      python: ${{ matrix.python }}
+      go: ${{ matrix.go }}
+      java: ${{ matrix.java }}
+      push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    secrets: inherit
+
+  sonarcloud:
+    name: SonarCloud SAST
+    runs-on: ubuntu-latest
+    # Skip on PRs from forks (no access to SONAR_TOKEN).
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: SonarCloud scan
+        if: ${{ env.SONAR_TOKEN != '' }}
+        uses: SonarSource/sonarqube-scan-action@v3
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+      - name: Sonar not configured
+        if: ${{ env.SONAR_TOKEN == '' }}
+        run: echo "SONAR_TOKEN not set — skipping SonarCloud. Add the secret to enable."

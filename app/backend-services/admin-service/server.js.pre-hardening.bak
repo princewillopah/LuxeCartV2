@@ -1,0 +1,178 @@
+const express = require('express');
+const { logger, requestLogger } = require('./shared/logger')('admin-service');
+
+const cors = require('cors');
+
+// Prometheus metrics
+const promClient = require('prom-client');
+const register = new promClient.Registry();
+
+
+
+const app = express();
+const PORT = process.env.PORT || 3010;
+
+// Database-per-service: admin-service owns NO domain tables. It is a
+// pure HTTP-composition layer that aggregates read-side views from
+// auth-service (/internal/users), order-service (/internal/stats etc.)
+// and product-service (/public). All sibling URLs are configurable via
+// env so the same image runs in compose, k8s and local dev.
+const AUTH_SERVICE_URL    = process.env.AUTH_SERVICE_URL    || 'http://auth-service:3001';
+const ORDER_SERVICE_URL   = process.env.ORDER_SERVICE_URL   || 'http://order-service:3007';
+const PRODUCT_SERVICE_URL = process.env.PRODUCT_SERVICE_URL || 'http://product-service:3003';
+
+async function getJson(url, label) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`${label} ${resp.status}`);
+  return resp.json();
+}
+
+app.use(cors());
+app.use(express.json());
+
+app.use(requestLogger);
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'Admin Service is running' });
+});
+
+///// prometheus
+register.setDefaultLabels({
+  service: 'admin-service'
+});
+
+promClient.collectDefaultMetrics({ register });
+
+const httpRequestCounter = new promClient.Counter({
+  name: 'http_requests_total',
+  help: 'Total HTTP requests',
+  labelNames: ['service', 'method', 'route', 'status']
+});
+
+const httpRequestDuration = new promClient.Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'HTTP request latency',
+  labelNames: ['service', 'method', 'route'],
+  buckets: [0.1, 0.3, 0.5, 1, 2, 5]
+});
+
+register.registerMetric(httpRequestCounter);
+register.registerMetric(httpRequestDuration);
+
+// ✅ middleware
+app.use((req, res, next) => {
+  if (req.path === '/metrics') return next(); 
+
+  const start = Date.now();
+
+  res.on('finish', () => {
+    const duration = (Date.now() - start) / 1000;
+
+    const route = req.route?.path || req.path || 'unknown';
+
+    httpRequestCounter.inc({
+      service: 'admin-service',
+      method: req.method,
+      route,
+      status: res.statusCode
+    });
+
+    httpRequestDuration.observe(
+      {
+        service: 'admin-service',
+        method: req.method,
+        route
+      },
+      duration
+    );
+  });
+
+  next();
+});
+
+// Get dashboard statistics — composed from sibling services (no local DB).
+app.get('/dashboard/stats', async (_req, res) => {
+  try {
+    // Parallel fan-out: 1 lightweight call per stat.
+    const [usersPage, orderStats, productsPage] = await Promise.all([
+      getJson(`${AUTH_SERVICE_URL}/internal/users?page=1&limit=1`, 'auth-service'),
+      getJson(`${ORDER_SERVICE_URL}/internal/stats`,               'order-service'),
+      getJson(`${PRODUCT_SERVICE_URL}/public?page=1&limit=1`,      'product-service'),
+    ]);
+    res.json({
+      totalUsers:    Number(usersPage?.total)    || 0,
+      totalOrders:   Number(orderStats?.totalOrders)   || 0,
+      totalRevenue:  Number(orderStats?.totalRevenue)  || 0,
+      totalProducts: Number(productsPage?.total) || 0,
+    });
+  } catch (error) {
+    logger.error({ err: error }, 'Dashboard stats error');
+    res.status(500).json({ error: 'Failed to fetch stats' });
+  }
+});
+
+// Get revenue analytics — proxied to order-service (orders DB lives there).
+app.get('/analytics/revenue', async (_req, res) => {
+  try {
+    const rows = await getJson(
+      `${ORDER_SERVICE_URL}/internal/analytics/revenue?days=30`,
+      'order-service'
+    );
+    res.json(rows);
+  } catch (error) {
+    logger.error({ err: error }, 'Revenue analytics error');
+    res.status(500).json({ error: 'Failed to fetch analytics' });
+  }
+});
+
+// Get top products — composed: pull top SKU ids/quantities from
+// order-service, enrich each with name/price/image from product-service.
+app.get('/analytics/top-products', async (_req, res) => {
+  try {
+    const top = await getJson(
+      `${ORDER_SERVICE_URL}/internal/analytics/top-products?limit=10`,
+      'order-service'
+    );
+    // Enrich in parallel; tolerate per-id failures (product may have
+    // been deleted; the snapshot product_name from order_items is the
+    // fallback returned by order-service).
+    const enriched = await Promise.all(top.map(async (row) => {
+      try {
+        const p = await getJson(
+          `${PRODUCT_SERVICE_URL}/public/${row.productId}`,
+          'product-service'
+        );
+        return {
+          id:           row.productId,
+          name:         p?.name  || row.productName,
+          price:        p?.price != null ? Number(p.price) : null,
+          order_count:  row.orderCount,
+          total_sold:   row.quantity,
+        };
+      } catch (_) {
+        return {
+          id:           row.productId,
+          name:         row.productName,
+          price:        null,
+          order_count:  row.orderCount,
+          total_sold:   row.quantity,
+        };
+      }
+    }));
+    res.json(enriched);
+  } catch (error) {
+    logger.error({ err: error }, 'Top products error');
+    res.status(500).json({ error: 'Failed to fetch top products' });
+  }
+});
+
+
+
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', register.contentType);
+  res.end(await register.metrics());
+});
+
+app.listen(PORT, () => {
+  console.log(`Admin Service running on port ${PORT}`);
+});

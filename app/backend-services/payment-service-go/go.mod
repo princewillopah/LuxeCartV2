@@ -5,7 +5,7 @@ go 1.24.0
 toolchain go1.24.13
 
 require (
-	github.com/go-chi/chi/v5 v5.1.0
+	github.com/go-chi/chi/v5 v5.3.0
 	github.com/jackc/pgx/v5 v5.6.0
 	github.com/prometheus/client_golang v1.20.5
 	github.com/segmentio/kafka-go v0.4.51

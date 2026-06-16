@@ -1,4 +1,4 @@
-FROM node:18-alpine
+FROM node:26-alpine
 WORKDIR /app
 # 
 COPY backend-services/auth-service/package*.json ./

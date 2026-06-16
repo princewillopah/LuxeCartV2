@@ -1,6 +1,6 @@
 # --- build stage -----------------------------------------------------------
 # Pin Go version. CGO disabled so the binary is static & runs on distroless.
-FROM golang:1.24-alpine AS build
+FROM golang:1.26-alpine AS build
 
 WORKDIR /src
 
@@ -25,7 +25,7 @@ RUN CGO_ENABLED=0 GOOS=linux \
 # debug against. Keeping curl in the image leaves us with a known-good
 # fallback if Cloudflare's rules tighten further.
 # Tradeoff: ~5MB bigger image and a shell — still small.
-FROM alpine:3.20
+FROM alpine:3.24
 
 RUN apk add --no-cache curl ca-certificates tzdata \
     && adduser -D -u 65532 -g '' nonroot

@@ -1,4 +1,4 @@
-FROM node:18-alpine
+FROM node:26-alpine
 WORKDIR /app
 # copy dependency manifests
 COPY backend-services/order-service/package*.json ./

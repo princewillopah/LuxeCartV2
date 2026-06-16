@@ -3,7 +3,7 @@
 # runtime stage. Layer the dependency download separately from the
 # source copy so editing a .java file doesn't re-pull the dependency
 # tree on every rebuild.
-FROM maven:3.9.9-eclipse-temurin-21 AS build
+FROM maven:3.9.15-eclipse-temurin-26 AS build
 WORKDIR /app
 
 # Resolve dependencies first — this layer is cached as long as pom.xml
@@ -17,7 +17,7 @@ RUN mvn -B -q -e -DskipTests package
 
 # ─── Stage 2: runtime ───────────────────────────────────────────────────
 # JRE-only image to keep the runtime small. We don't ship Maven.
-FROM eclipse-temurin:21-jre-alpine
+FROM eclipse-temurin:25-jre-alpine
 WORKDIR /app
 
 # Drop privileges — Spring Boot doesn't need root inside the container.

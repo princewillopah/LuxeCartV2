@@ -40,11 +40,11 @@ jobs:
     env:
       TARGET: ${{ github.event.inputs.target || vars.TARGET_URL || 'http://4.180.228.58.nip.io:18080' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: ZAP baseline scan
         if: ${{ (github.event.inputs.scan_type || 'baseline') == 'baseline' }}
-        uses: zaproxy/action-baseline@v0.12.0
+        uses: zaproxy/action-baseline@v0.15.0
         with:
           target: ${{ env.TARGET }}
           cmd_options: "-a"          # include alpha passive rules
@@ -53,7 +53,7 @@ jobs:
 
       - name: ZAP full scan
         if: ${{ github.event.inputs.scan_type == 'full' }}
-        uses: zaproxy/action-full-scan@v0.12.0
+        uses: zaproxy/action-full-scan@v0.13.0
         with:
           target: ${{ env.TARGET }}
           fail_action: false
